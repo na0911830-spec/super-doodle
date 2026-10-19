@@ -182,7 +182,7 @@ class PriorityTaskQueue:
 TASK_QUEUE = PriorityTaskQueue()
 QUEUED_SET = set()
 QUEUED_SET_LOCK = threading.Lock()
-NUM_WORKERS = 50
+NUM_WORKERS = 100
 WORKER_THREADS = []
 
 URL_PATTERN = re.compile(r'https?://[^\s]+')
@@ -607,7 +607,7 @@ def lossless_worker_loop():
             time.sleep(1)
 
 LOSSLESS_WORKER_THREADS = []
-NUM_LOSSLESS_WORKERS = 50
+NUM_LOSSLESS_WORKERS = 100
 
 def start_lossless_workers_if_needed():
     global LOSSLESS_WORKER_THREADS
@@ -810,7 +810,7 @@ def auto_lossless_sync_loop():
     time.sleep(10)  # initial delay for cache loading
     while True:
         try:
-            if not is_cleanup_active() and LOSSLESS_TASK_QUEUE.qsize() < 25:
+            if not is_cleanup_active() and LOSSLESS_TASK_QUEUE.qsize() < 50:
                 trigger_lossless_backup()
         except Exception as e:
             log.error(f"Error in auto_lossless_sync_loop: {e}")
@@ -821,7 +821,7 @@ def trigger_lossless_backup() -> int:
         log.info("Skipping lossless backup enqueueing: Cleanup process is currently active.")
         return 0
 
-    if LOSSLESS_TASK_QUEUE.qsize() >= 50:
+    if LOSSLESS_TASK_QUEUE.qsize() >= 100:
         return 0
 
     with DB_CACHE_LOCK:
@@ -836,7 +836,7 @@ def trigger_lossless_backup() -> int:
                     LOSSLESS_JOBS[vid] = {"status": "queued", "timestamp": time.time()}
                 LOSSLESS_TASK_QUEUE.put(vid, high_priority=False)
                 count += 1
-                if LOSSLESS_TASK_QUEUE.qsize() >= 50:
+                if LOSSLESS_TASK_QUEUE.qsize() >= 100:
                     break
 
     LOSSLESS_STATS["queued"] = LOSSLESS_TASK_QUEUE.qsize()

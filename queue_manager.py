@@ -123,7 +123,7 @@ QUEUED_SET_LOCK = threading.Lock()
 
 # Worker threads pool
 WORKER_THREADS = []
-NUM_WORKERS = 50
+NUM_WORKERS = 100
 
 def get_avg_uploads_per_min() -> float:
     now = time.time()
@@ -392,12 +392,12 @@ def lossless_worker_loop():
             log.error(f"Error in lossless worker thread loop: {e}")
 
 LOSSLESS_WORKER_THREADS = []
-NUM_LOSSLESS_WORKERS = 50
+NUM_LOSSLESS_WORKERS = 100
 
 def trigger_lossless_backup() -> int:
     """Enqueues songs in DB where lossless source is missing (throttled queue to protect RAM & CPU)."""
     global LOSSLESS_WORKER_THREADS
-    if LOSSLESS_TASK_QUEUE.qsize() >= 50:
+    if LOSSLESS_TASK_QUEUE.qsize() >= 100:
         return 0
 
     with db_service.DB_CACHE_LOCK:
@@ -411,7 +411,7 @@ def trigger_lossless_backup() -> int:
                     LOSSLESS_QUEUED_SET.add(vid)
                     LOSSLESS_TASK_QUEUE.put(vid)
                     count += 1
-                    if LOSSLESS_TASK_QUEUE.qsize() >= 50:
+                    if LOSSLESS_TASK_QUEUE.qsize() >= 100:
                         break
 
     LOSSLESS_STATS["queued"] = LOSSLESS_TASK_QUEUE.qsize()
