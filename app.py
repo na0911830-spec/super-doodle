@@ -940,12 +940,33 @@ def memory_cleanup_daemon():
         except Exception:
             pass
 
+def auto_stream_sync_loop():
+    """Background daemon loop that continuously feeds DB songs missing stream sources into TASK_QUEUE."""
+    log.info("Starting automatic stream queue feeder daemon thread...")
+    time.sleep(15)
+    while True:
+        try:
+            if TASK_QUEUE.qsize() < 100:
+                with DB_CACHE_LOCK:
+                    missing = [vid for vid, song in DB_CACHE.items() if not song.get("stream_sources")]
+                with QUEUED_SET_LOCK:
+                    for vid in missing:
+                        if vid not in QUEUED_SET:
+                            enqueue_song(vid, high_priority=False)
+                            if TASK_QUEUE.qsize() >= 100:
+                                break
+        except Exception as e:
+            log.error(f"Error in auto_stream_sync_loop: {e}")
+        time.sleep(10)
+
 @app.on_event("startup")
 def startup_event():
     init_db()
     start_queue_workers()
     backup_thread = threading.Thread(target=db_backup_loop, daemon=True)
     backup_thread.start()
+    stream_feeder_thread = threading.Thread(target=auto_stream_sync_loop, daemon=True)
+    stream_feeder_thread.start()
     lossless_sync_thread = threading.Thread(target=auto_lossless_sync_loop, daemon=True)
     lossless_sync_thread.start()
     gc_thread = threading.Thread(target=memory_cleanup_daemon, daemon=True)
