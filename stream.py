@@ -4,7 +4,6 @@ import sys
 # Enforce zero shard/chunk disk cache on HuggingFace Xet to prevent 10GB+ cache accumulation
 os.environ.setdefault("HF_XET_SHARD_CACHE_SIZE_LIMIT", "0")
 os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
-os.environ.setdefault("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "33554432")
 os.environ.setdefault("HF_XET_LOG_DIR_MAX_SIZE", "10000000")
 os.environ.setdefault("HF_HUB_DISABLE_DISK_INTEGRITY_CHECK", "1")
 

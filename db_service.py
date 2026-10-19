@@ -10,7 +10,6 @@ from logger_config import log
 # Enforce zero shard/chunk disk cache on HuggingFace Xet to prevent 10GB+ cache accumulation
 os.environ.setdefault("HF_XET_SHARD_CACHE_SIZE_LIMIT", "0")
 os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
-os.environ.setdefault("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "33554432")
 os.environ.setdefault("HF_XET_LOG_DIR_MAX_SIZE", "10000000")
 os.environ.setdefault("HF_HUB_DISABLE_DISK_INTEGRITY_CHECK", "1")
 
@@ -169,13 +168,6 @@ def load_db_cache(force_hf: bool = True):
                 log.warning("HF db_backup.json had empty songs list.")
     except Exception as hf_ex:
         log.error(f"Failed to load dataset from HF backup: {hf_ex}")
-
-    with DB_CACHE_LOCK:
-        empty_cache = (len(DB_CACHE) == 0)
-
-    if empty_cache:
-        log.warning("Cache is empty! Auto-reconstructing from storage buckets...")
-        reconstruct_from_buckets(save_to_hf=True)
 
 def load_db_stats():
     """Load stats from DB cache."""
@@ -342,12 +334,8 @@ def sync_cache_with_buckets(save_backup: bool = True) -> dict:
     }
 
 def init_db():
-    """Initialize in-memory database cache from Hugging Face json backup and sync with buckets."""
+    """Initialize in-memory database cache from Hugging Face json backup."""
     load_db_cache()
-    try:
-        sync_cache_with_buckets(save_backup=True)
-    except Exception as s_err:
-        log.error(f"Bucket synchronization on startup encountered an error: {s_err}")
     load_db_stats()
 
 def db_backup_loop():

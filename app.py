@@ -4,7 +4,6 @@ import sys
 # Enforce zero shard/chunk disk cache on HuggingFace Xet to prevent 10GB+ cache accumulation
 os.environ.setdefault("HF_XET_SHARD_CACHE_SIZE_LIMIT", "0")
 os.environ.setdefault("HF_XET_CHUNK_CACHE_SIZE_BYTES", "0")
-os.environ.setdefault("HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT", "33554432")
 os.environ.setdefault("HF_XET_LOG_DIR_MAX_SIZE", "10000000")
 os.environ.setdefault("HF_HUB_DISABLE_DISK_INTEGRITY_CHECK", "1")
 
@@ -235,16 +234,6 @@ def load_db_cache():
     except Exception as hf_ex:
         log.error(f"Failed to load complete dataset from HF backup: {hf_ex}")
 
-    with DB_CACHE_LOCK:
-        empty_cache = (len(DB_CACHE) == 0)
-
-    if empty_cache:
-        log.warning("Cache is empty! Auto-reconstructing from storage buckets...")
-        try:
-            db_service.reconstruct_from_buckets(save_to_hf=True)
-        except Exception as r_err:
-            log.error(f"Auto-reconstruction failed: {r_err}")
-
 def load_db_stats():
     try:
         with DB_CACHE_LOCK:
@@ -258,10 +247,6 @@ def load_db_stats():
 
 def init_db():
     load_db_cache()
-    try:
-        db_service.sync_cache_with_buckets(save_backup=True)
-    except Exception as s_err:
-        log.error(f"Bucket synchronization on startup encountered an error: {s_err}")
     load_db_stats()
 
 DB_BACKUP_INTERVAL = int(os.environ.get("DB_BACKUP_INTERVAL", "180"))
