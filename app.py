@@ -810,11 +810,11 @@ def auto_lossless_sync_loop():
     time.sleep(10)  # initial delay for cache loading
     while True:
         try:
-            if not is_cleanup_active():
+            if not is_cleanup_active() and LOSSLESS_TASK_QUEUE.qsize() < 25:
                 trigger_lossless_backup()
         except Exception as e:
             log.error(f"Error in auto_lossless_sync_loop: {e}")
-        time.sleep(300)  # check and re-trigger every 5 minutes (prevents CPU thrashing)
+        time.sleep(5)  # Re-check every 5 seconds continuously
 
 def trigger_lossless_backup() -> int:
     if is_cleanup_active():
