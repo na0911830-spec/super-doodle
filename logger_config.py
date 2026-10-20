@@ -21,7 +21,7 @@ stdout_handler = logging.StreamHandler(sys.stdout)
 file_handler = logging.FileHandler("stream_service.log", encoding="utf-8")
 log_handler = InMemoryLogHandler()
 
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+formatter = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 stdout_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 log_handler.setFormatter(formatter)
@@ -31,5 +31,8 @@ root_logger.setLevel(LOG_LEVEL)
 root_logger.addHandler(stdout_handler)
 root_logger.addHandler(file_handler)
 root_logger.addHandler(log_handler)
+
+for noisy in ["httpx", "httpcore", "urllib3", "huggingface_hub"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger("stream-service")

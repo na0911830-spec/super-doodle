@@ -132,7 +132,7 @@ def resolve_highest_flac_m3u8(manifest_url: str) -> str:
             # Sort descending by bandwidth to pick highest quality (e.g. 96kHz / 24-bit)
             variants.sort(key=lambda x: x["bandwidth"], reverse=True)
             best_variant = variants[0]
-            log.info(f"Selected highest FLAC variant: bandwidth={best_variant['bandwidth']}, codec={best_variant['codec']}")
+            log.debug(f"Selected highest FLAC variant: bandwidth={best_variant['bandwidth']}, codec={best_variant['codec']}")
             return best_variant["uri"]
     except Exception as e:
         log.warning(f"Error parsing master m3u8 playlist: {e}")
@@ -153,14 +153,14 @@ def convert_m3u8_to_flac_bytes(manifest_url: str) -> Optional[bytes]:
         "-f", "flac",
         "-",
     ]
-    log.info(f"Converting Tidal m3u8 stream to FLAC via ffmpeg copy (highest FLAC variant)...")
+    log.debug(f"Converting Tidal m3u8 stream to FLAC via ffmpeg copy (highest FLAC variant)...")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out, err = proc.communicate(timeout=120)
         if proc.returncode == 0 and len(out) > 0 and out[:4] == b"fLaC":
             return out
         else:
-            log.warning(f"ffmpeg copy failed (rc={proc.returncode}), attempting flac decode transcode: {err.decode('utf-8', errors='ignore')[-200:]}")
+            log.debug(f"ffmpeg copy failed (rc={proc.returncode}), attempting flac decode transcode: {err.decode('utf-8', errors='ignore')[-200:]}")
             cmd_transcode = [
                 ffmpeg_bin,
                 "-reconnect", "1",
@@ -175,7 +175,7 @@ def convert_m3u8_to_flac_bytes(manifest_url: str) -> Optional[bytes]:
             out2, err2 = proc2.communicate(timeout=120)
             if proc2.returncode == 0 and len(out2) > 0 and out2[:4] == b"fLaC":
                 return out2
-            log.error(f"ffmpeg transcode failed (rc={proc2.returncode}): {err2.decode('utf-8', errors='ignore')[-300:]}")
+            log.debug(f"ffmpeg transcode failed (rc={proc2.returncode}): {err2.decode('utf-8', errors='ignore')[-300:]}")
     except Exception as e:
         log.error(f"ffmpeg error converting m3u8 to FLAC: {e}")
     return None
@@ -216,15 +216,12 @@ def upload_audio_to_hf_bucket(audio_bytes: bytes, video_id: str, ext: str, corre
             "artist": correct_artist,
         }
 
-def process_qobuz_lossless(video_id: str, song_name: str = "", artist_name: str = "") -> dict:
+def fetch_lossless_audio(video_id: str, song_name: str = "", artist_name: str = "") -> Optional[dict]:
     """
-    Fetch metadata and streams using official audio provider API for video_id.
-    1. First attempts primary Qobuz provider.
-    2. If Qobuz fails or is unavailable, falls back to Tidal Render instance (https://flac-6c8l.onrender.com).
-       Extracts HLS m3u8 manifest and uses ffmpeg to convert to FLAC bytes directly from Tidal CDN.
-    3. Uploads FLAC to Hugging Face bucket.
+    Fetch and download/convert FLAC audio for video_id from Qobuz or Render Tidal HLS fallback.
+    Returns dict with audio_bytes and metadata on success, or None on failure.
+    Does NOT upload to Hugging Face (used by parallel batch processors for grouped uploads).
     """
-    log.info(f"Querying primary Qobuz API for ID: {video_id}...")
     worker_data = fetch_worker_lossless_info(video_id)
     
     correct_title = song_name
@@ -249,28 +246,28 @@ def process_qobuz_lossless(video_id: str, song_name: str = "", artist_name: str 
             stream_url = selected_stream["url"]
             format_id = selected_stream.get("format_id", 6)
             mime_type = selected_stream.get("mime_type", "audio/flac")
-            sampling_rate = selected_stream.get("sampling_rate", 44.1)
 
             if "flac" in mime_type.lower():
-                log.info(f"Downloading Qobuz FLAC stream for {video_id} (format_id={format_id}, rate={sampling_rate}kHz)...")
                 try:
-                    t0 = time.time()
                     with httpx.Client(timeout=120.0, follow_redirects=True) as client:
                         resp = client.get(stream_url)
                         if resp.status_code == 200:
                             audio_bytes = resp.content
                             if len(audio_bytes) > 0 and audio_bytes[:4] == b"fLaC":
-                                log.info(f"Downloaded {len(audio_bytes)} bytes of Qobuz FLAC in {time.time() - t0:.2f}s")
-                                upload_res = upload_audio_to_hf_bucket(audio_bytes, video_id, "flac", correct_title, correct_artist, format_id)
-                                if upload_res.get("success"):
-                                    return upload_res
+                                return {
+                                    "video_id": video_id,
+                                    "audio_bytes": audio_bytes,
+                                    "ext": "flac",
+                                    "format_id": format_id,
+                                    "title": correct_title,
+                                    "artist": correct_artist,
+                                    "source": "qobuz",
+                                }
                 except Exception as e:
-                    log.error(f"Error downloading Qobuz stream for {video_id}: {e}")
+                    log.debug(f"Error downloading Qobuz stream for {video_id}: {e}")
 
-    # --- FALLBACK: Render Tidal API Instance (STRICTLY FLAC ONLY) ---
-    log.warning(f"Primary Qobuz provider failed or had no FLAC stream for {video_id}. Falling back to Tidal Render instance ({RENDER_API_BASE})...")
+    # Fallback to Render Tidal API Instance
     render_data = fetch_render_fallback_info(video_id)
-
     if render_data:
         r_ytmusic = render_data.get("ytmusic", {})
         r_matched = render_data.get("matched_track", {})
@@ -286,19 +283,40 @@ def process_qobuz_lossless(video_id: str, song_name: str = "", artist_name: str 
         )
 
         if manifest_url:
-            log.info(f"Found Tidal HLS manifest for {video_id}: converting highest available FLAC variant to FLAC...")
-            t0 = time.time()
             flac_bytes = convert_m3u8_to_flac_bytes(manifest_url)
             if flac_bytes and len(flac_bytes) > 0 and flac_bytes[:4] == b"fLaC":
-                log.info(f"Converted Tidal m3u8 to {len(flac_bytes)} bytes of pure FLAC in {time.time() - t0:.2f}s")
-                upload_res = upload_audio_to_hf_bucket(flac_bytes, video_id, "flac", correct_title, correct_artist, 6)
-                if upload_res.get("success"):
-                    upload_res["source"] = "render_tidal_m3u8"
-                    return upload_res
+                return {
+                    "video_id": video_id,
+                    "audio_bytes": flac_bytes,
+                    "ext": "flac",
+                    "format_id": 6,
+                    "title": correct_title,
+                    "artist": correct_artist,
+                    "source": "render_tidal_m3u8",
+                }
 
-    log.warning(f"All providers (Qobuz & Tidal Render) failed to provide playable FLAC audio for {video_id} ('{correct_title}' - '{correct_artist}')")
+    return None
+
+def process_qobuz_lossless(video_id: str, song_name: str = "", artist_name: str = "") -> dict:
+    """
+    Fetch metadata, download FLAC, and upload to Hugging Face bucket (standalone single-track).
+    """
+    result = fetch_lossless_audio(video_id, song_name, artist_name)
+    if result:
+        upload_res = upload_audio_to_hf_bucket(
+            result["audio_bytes"],
+            video_id,
+            result["ext"],
+            result["title"],
+            result["artist"],
+            result["format_id"],
+        )
+        if upload_res.get("success"):
+            upload_res["source"] = result.get("source")
+            return upload_res
+
     return {
         "success": False,
-        "title": correct_title,
-        "artist": correct_artist,
+        "title": song_name,
+        "artist": artist_name,
     }

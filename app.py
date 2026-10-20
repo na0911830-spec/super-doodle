@@ -82,7 +82,7 @@ stdout_handler = logging.StreamHandler(sys.stdout)
 file_handler = logging.FileHandler("stream_service.log", encoding="utf-8")
 log_handler = InMemoryLogHandler()
 
-formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+formatter = logging.Formatter("%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 stdout_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 log_handler.setFormatter(formatter)
@@ -92,6 +92,9 @@ root_logger.setLevel(LOG_LEVEL)
 root_logger.addHandler(stdout_handler)
 root_logger.addHandler(file_handler)
 root_logger.addHandler(log_handler)
+
+for noisy in ["httpx", "httpcore", "urllib3", "huggingface_hub"]:
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 log = logging.getLogger("stream-service")
 
@@ -182,7 +185,12 @@ class PriorityTaskQueue:
 TASK_QUEUE = PriorityTaskQueue()
 QUEUED_SET = set()
 QUEUED_SET_LOCK = threading.Lock()
-NUM_WORKERS = 100
+BATCH_SIZE = 50
+NUM_STREAM_WORKERS = 50
+NUM_LOSSLESS_WORKERS = 50
+NUM_WORKERS = 50
+STREAM_PROCESSOR_THREAD = None
+LOSSLESS_PROCESSOR_THREAD = None
 WORKER_THREADS = []
 
 URL_PATTERN = re.compile(r'https?://[^\s]+')
@@ -389,17 +397,17 @@ def db_save_lossless_source(video_id: str, value: str = "4:flac"):
             db_service.DB_CACHE[video_id] = dict(DB_CACHE[video_id])
     log.info(f"Updated lossless to '{value}' for {video_id}")
 
-def process_stream_job(video_id: str) -> bool:
-    STREAM_JOBS[video_id] = {"status": "progressing", "timestamp": time.time()}
-    STATS["progressing"] = sum(1 for j in STREAM_JOBS.values() if j["status"] in ["queued", "progressing"])
-    
+def fetch_stream_audio(video_id: str) -> Optional[tuple[bytes, str]]:
+    """
+    Downloads audio bytes for video_id via Invidious / antideploy proxy or fallback.
+    Returns (audio_bytes, ext) or None on failure.
+    Does NOT upload to Hugging Face directly (batch worker uploads all at once).
+    """
     for instance in INVIDIOUS_INSTANCES:
         try:
-            log.info(f"Attempting download/upload for {video_id} using {instance}")
             with httpx.Client(timeout=30.0) as client:
                 url = f"{instance.rstrip('/')}/api/v1/videos/{video_id}"
                 if not is_safe_domain_url(url):
-                    log.error(f"SECURITY: Blocked attempt to contact direct IP: {url}")
                     continue
                 resp = client.get(url)
                 if resp.status_code != 200:
@@ -409,7 +417,11 @@ def process_stream_job(video_id: str) -> bool:
                 except ValueError:
                     continue
                 formats = data.get("adaptiveFormats", [])
-                m4a_formats = [f for f in formats if f.get("type", "").startswith("audio/") and ("mp4" in f.get("type", "") or f.get("container") == "m4a")]
+                m4a_formats = [
+                    f for f in formats 
+                    if f.get("type", "").startswith("audio/") and 
+                    ("mp4" in f.get("type", "") or f.get("container") == "m4a")
+                ]
                 if m4a_formats:
                     m4a_formats.sort(key=lambda x: int(x.get("bitrate") or 0), reverse=True)
                     selected_format = m4a_formats[0]
@@ -432,9 +444,8 @@ def process_stream_job(video_id: str) -> bool:
                 original_host = parsed.netloc
                 proxied_url = f"{instance.rstrip('/')}/videoplayback?{parsed.query}&host={original_host}"
                 if not is_safe_domain_url(proxied_url):
-                    log.error(f"SECURITY: Blocked attempt to stream from direct IP: {proxied_url}")
                     continue
-                t0 = time.time()
+
                 stream_resp = client.get(proxied_url)
                 if stream_resp.status_code != 200:
                     stream_resp = client.get(f"{instance.rstrip('/')}/stream/{video_id}")
@@ -443,105 +454,180 @@ def process_stream_job(video_id: str) -> bool:
                     if stream_resp.headers.get("x-audio-extension"):
                         ext = stream_resp.headers.get("x-audio-extension")
                 audio_bytes = stream_resp.content
-                t1 = time.time()
-                dl_duration = t1 - t0
-                if dl_duration > 0:
-                    NETWORK_STATS["last_download_speed_kbps"] = len(audio_bytes) / dl_duration / 1024.0
-                NETWORK_STATS["total_downloaded_mb"] += len(audio_bytes) / (1024.0 * 1024.0)
-                
-            t0 = time.time()
-            from db_service import safe_batch_bucket_files
-            safe_batch_bucket_files(BUCKET_ID, add=[(audio_bytes, f"{video_id}.{ext}")], token=HF_TOKEN)
-            t1 = time.time()
-            ul_duration = t1 - t0
-            if ul_duration > 0:
-                NETWORK_STATS["last_upload_speed_kbps"] = len(audio_bytes) / ul_duration / 1024.0
-            NETWORK_STATS["total_uploaded_mb"] += len(audio_bytes) / (1024.0 * 1024.0)
-            
-            # Explicit memory and disk cache cleanup
-            del audio_bytes
-            db_service.cleanup_upload_cache()
-
-            db_save_stream_source(video_id, ext)
-            with DB_CACHE_LOCK:
-                STREAM_JOBS[video_id] = {"status": "done", "timestamp": time.time(), "ext": ext}
-                if len(STREAM_JOBS) > 500:
-                    STREAM_JOBS.popitem(last=False)
-            STATS["done"] += 1
-            STATS["progressing"] = sum(1 for j in STREAM_JOBS.values() if j["status"] in ["queued", "progressing"])
-            UPLOAD_TIMESTAMPS.append(time.time())
-            log.info(f"Stream upload successfully completed for {video_id}.{ext}")
-            return True
-        except Exception as e:
-            if 'audio_bytes' in locals():
-                del audio_bytes
-            db_service.cleanup_upload_cache()
-            if not isinstance(e, (httpx.HTTPError, httpx.NetworkError, httpx.TimeoutException, ValueError, KeyError)):
-                err_msg = f"{type(e).__name__} for {video_id}: {str(e)}"
-                if err_msg not in FATAL_ERRORS:
-                    FATAL_ERRORS.append(err_msg)
+                if audio_bytes and len(audio_bytes) > 1024:
+                    return audio_bytes, ext
+        except Exception:
             continue
 
-    log.info(f"Attempting ultimate fallback for {video_id}...")
-    ext = "m4a"
+    # Fallback to Render stream endpoint
     try:
         fallback_url = f"https://effective-disco-3nfb.onrender.com/api/stream/{video_id}"
         with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-            t0 = time.time()
             resp = client.get(fallback_url)
             if resp.status_code == 200:
                 audio_bytes = resp.content
-                t1 = time.time()
-                dl_duration = t1 - t0
-                if dl_duration > 0:
-                    NETWORK_STATS["last_download_speed_kbps"] = len(audio_bytes) / dl_duration / 1024.0
-                NETWORK_STATS["total_downloaded_mb"] += len(audio_bytes) / (1024.0 * 1024.0)
-                ext = "webm" if "webm" in resp.headers.get("content-type", "") else "m4a"
-                t0_up = time.time()
-                from db_service import safe_batch_bucket_files
-                safe_batch_bucket_files(BUCKET_ID, add=[(audio_bytes, f"{video_id}.{ext}")], token=HF_TOKEN)
-                t1_up = time.time()
-                ul_duration = t1_up - t0_up
-                if ul_duration > 0:
-                    NETWORK_STATS["last_upload_speed_kbps"] = len(audio_bytes) / ul_duration / 1024.0
-                NETWORK_STATS["total_uploaded_mb"] += len(audio_bytes) / (1024.0 * 1024.0)
-                
-                del audio_bytes
-                db_service.cleanup_upload_cache()
+                if audio_bytes and len(audio_bytes) > 1024:
+                    ext = "webm" if "webm" in resp.headers.get("content-type", "") else "m4a"
+                    return audio_bytes, ext
+    except Exception:
+        pass
 
-                db_save_stream_source(video_id, ext)
-                with DB_CACHE_LOCK:
-                    STREAM_JOBS[video_id] = {"status": "done", "timestamp": time.time(), "ext": ext}
-                    if len(STREAM_JOBS) > 500:
-                        STREAM_JOBS.popitem(last=False)
-                STATS["done"] += 1
-                STATS["progressing"] = sum(1 for j in STREAM_JOBS.values() if j["status"] in ["queued", "progressing"])
-                UPLOAD_TIMESTAMPS.append(time.time())
+    return None
 
-                # Enqueue lossless job to worker queue instead of spawning thread per request
-                with LOSSLESS_QUEUED_LOCK:
-                    if video_id not in LOSSLESS_QUEUED_SET:
-                        LOSSLESS_QUEUED_SET.add(video_id)
-                        with LOSSLESS_JOBS_LOCK:
-                            LOSSLESS_JOBS[video_id] = {"status": "queued", "timestamp": time.time()}
-                        LOSSLESS_TASK_QUEUE.put(video_id, high_priority=False)
-                        LOSSLESS_STATS["queued"] += 1
-                        start_lossless_workers_if_needed()
-
-                return True
-    except Exception as fallback_ex:
-        if 'audio_bytes' in locals():
-            del audio_bytes
-        db_service.cleanup_upload_cache()
-        log.error(f"Ultimate fallback failed for {video_id}: {fallback_ex}")
-
+def process_stream_job(video_id: str) -> bool:
+    """Standalone fallback to process a single video stream if invoked directly."""
+    res = fetch_stream_audio(video_id)
+    if res:
+        audio_bytes, ext = res
+        try:
+            from db_service import safe_batch_bucket_files
+            safe_batch_bucket_files(BUCKET_ID, add=[(audio_bytes, f"{video_id}.{ext}")], token=HF_TOKEN)
+            db_service.cleanup_upload_cache()
+            db_save_stream_source(video_id, ext)
+            with DB_CACHE_LOCK:
+                STREAM_JOBS[video_id] = {"status": "done", "timestamp": time.time(), "ext": ext}
+            STATS["done"] += 1
+            UPLOAD_TIMESTAMPS.append(time.time())
+            return True
+        except Exception as e:
+            log.error(f"[STREAM] Upload error for {video_id}: {e}")
     with DB_CACHE_LOCK:
-        STREAM_JOBS[video_id] = {"status": "failed", "error": "All instances failed", "timestamp": time.time()}
-        if len(STREAM_JOBS) > 500:
-            STREAM_JOBS.popitem(last=False)
+        STREAM_JOBS[video_id] = {"status": "failed", "timestamp": time.time()}
     STATS["failed"] += 1
-    STATS["progressing"] = sum(1 for j in STREAM_JOBS.values() if j["status"] in ["queued", "progressing"])
     return False
+
+def stream_batch_worker_loop():
+    """
+    Dedicated stream batch processor:
+    Pulls up to 50 stream tasks from TASK_QUEUE.
+    Spawns 50 parallel workers to download audio bytes.
+    When all 50 finish (success or fail), uploads all successfully downloaded files at once!
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    batch_num = 0
+    executor = ThreadPoolExecutor(max_workers=NUM_STREAM_WORKERS, thread_name_prefix="StreamWorker")
+    
+    log.info(f"[STREAM] ⚡ Stream batch processor online with {NUM_STREAM_WORKERS} parallel workers.")
+    
+    while True:
+        try:
+            batch_ids = []
+            while len(batch_ids) < BATCH_SIZE:
+                try:
+                    vid = TASK_QUEUE.get_nowait()
+                    if vid:
+                        batch_ids.append(vid)
+                except queue.Empty:
+                    break
+            
+            if not batch_ids:
+                time.sleep(1)
+                continue
+                
+            batch_num += 1
+            t_start = time.time()
+            with DB_CACHE_LOCK:
+                for vid in batch_ids:
+                    STREAM_JOBS[vid] = {"status": "progressing", "timestamp": time.time()}
+            STATS["progressing"] = len(batch_ids)
+            
+            log.info(f"[STREAM] 🚀 Batch #{batch_num}: Processing {len(batch_ids)} tracks in parallel (50 workers | Queue: {TASK_QUEUE.qsize()} remaining)")
+            
+            futures = {executor.submit(fetch_stream_audio, vid): vid for vid in batch_ids}
+            results = {}
+            for fut in as_completed(futures):
+                vid = futures[fut]
+                try:
+                    res = fut.result()
+                    results[vid] = res
+                except Exception:
+                    results[vid] = None
+                    
+            elapsed_dl = max(0.001, time.time() - t_start)
+            
+            success_files = []
+            failed_vids = []
+            total_bytes = 0
+            
+            for vid in batch_ids:
+                res = results.get(vid)
+                if res and res[0]:
+                    audio_bytes, ext = res
+                    success_files.append((vid, audio_bytes, ext))
+                    total_bytes += len(audio_bytes)
+                else:
+                    failed_vids.append(vid)
+                    
+            mb = total_bytes / (1024.0 * 1024.0)
+            dl_speed = mb / elapsed_dl
+            log.info(f"[STREAM] ⚡ Batch #{batch_num}: {len(success_files)}/{len(batch_ids)} downloaded in {elapsed_dl:.1f}s ({dl_speed:.1f} MB/s) | {len(failed_vids)} failed")
+            
+            NETWORK_STATS["last_download_speed_kbps"] = (total_bytes / elapsed_dl) / 1024.0 if elapsed_dl > 0 else 0
+            NETWORK_STATS["total_downloaded_mb"] += mb
+            
+            if success_files:
+                log.info(f"[STREAM] 📦 Batch #{batch_num}: Uploading {len(success_files)} files ({mb:.1f} MB) at once to HF bucket '{BUCKET_ID}'...")
+                t_up = time.time()
+                add_list = [(audio_bytes, f"{vid}.{ext}") for vid, audio_bytes, ext in success_files]
+                try:
+                    from db_service import safe_batch_bucket_files
+                    safe_batch_bucket_files(BUCKET_ID, add=add_list, token=HF_TOKEN)
+                    up_elapsed = max(0.001, time.time() - t_up)
+                    up_speed = mb / up_elapsed
+                    log.info(f"[STREAM] ✅ Batch #{batch_num}: Upload completed in {up_elapsed:.1f}s ({up_speed:.1f} MB/s)!")
+                    
+                    NETWORK_STATS["last_upload_speed_kbps"] = (total_bytes / up_elapsed) / 1024.0
+                    NETWORK_STATS["total_uploaded_mb"] += mb
+                    
+                    for _ in range(len(success_files)):
+                        UPLOAD_TIMESTAMPS.append(time.time())
+                        
+                    for vid, _, ext in success_files:
+                        db_save_stream_source(vid, ext)
+                        with DB_CACHE_LOCK:
+                            STREAM_JOBS[vid] = {"status": "done", "timestamp": time.time(), "ext": ext}
+                        
+                        # Also enqueue to lossless queue if missing lossless
+                        with LOSSLESS_QUEUED_LOCK:
+                            if vid not in LOSSLESS_QUEUED_SET:
+                                with DB_CACHE_LOCK:
+                                    lossless_val = str((DB_CACHE.get(vid) or {}).get("lossless") or "").strip()
+                                if not lossless_val or lossless_val == "0":
+                                    LOSSLESS_QUEUED_SET.add(vid)
+                                    with LOSSLESS_JOBS_LOCK:
+                                        LOSSLESS_JOBS[vid] = {"status": "queued", "timestamp": time.time()}
+                                    LOSSLESS_TASK_QUEUE.put(vid, high_priority=False)
+                                    LOSSLESS_STATS["queued"] = LOSSLESS_TASK_QUEUE.qsize()
+
+                    STATS["done"] += len(success_files)
+                except Exception as up_err:
+                    log.error(f"[STREAM] ❌ Batch #{batch_num}: Upload failed: {up_err}")
+                    for vid, _, _ in success_files:
+                        failed_vids.append(vid)
+                finally:
+                    del add_list
+                    del success_files
+                    db_service.cleanup_upload_cache()
+                    gc.collect()
+                    
+            if failed_vids:
+                with DB_CACHE_LOCK:
+                    for vid in failed_vids:
+                        STREAM_JOBS[vid] = {"status": "failed", "timestamp": time.time()}
+                STATS["failed"] += len(failed_vids)
+                
+            with QUEUED_SET_LOCK:
+                for vid in batch_ids:
+                    QUEUED_SET.discard(vid)
+            for _ in range(len(batch_ids)):
+                TASK_QUEUE.task_done()
+                
+            STATS["progressing"] = 0
+            log.info(f"[STREAM] 📊 Batch #{batch_num} complete | Total Stream Cached: {STATS['done']} | Failed: {STATS['failed']}")
+            
+        except Exception as e:
+            log.error(f"[STREAM] Error in stream batch loop: {e}")
+            time.sleep(1)
 
 # Dedicated Lossless Queue for Backup sequence in app.py
 LOSSLESS_TASK_QUEUE = PriorityTaskQueue()
@@ -553,72 +639,144 @@ LOSSLESS_JOBS = {}  # video_id -> {"status": "queued"|"progressing"|"done"|"fail
 FAILED_LOSSLESS_IDS = set()
 FAILED_LOSSLESS_LOCK = threading.Lock()
 
-def lossless_worker_loop():
+def lossless_batch_worker_loop():
+    """
+    Dedicated lossless batch processor:
+    Pulls up to 50 lossless tasks from LOSSLESS_TASK_QUEUE.
+    Spawns 50 parallel workers to download/convert FLAC bytes.
+    When all 50 finish (success or fail), uploads all successfully downloaded FLAC files at once!
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    batch_num = 0
+    executor = ThreadPoolExecutor(max_workers=NUM_LOSSLESS_WORKERS, thread_name_prefix="LosslessWorker")
+    
+    log.info(f"[LOSSLESS] ⚡ Lossless batch processor online with {NUM_LOSSLESS_WORKERS} parallel workers.")
+    
     while True:
         try:
-            video_id = LOSSLESS_TASK_QUEUE.get()
-            if video_id is None:
+            if is_cleanup_active():
+                time.sleep(2)
                 continue
+                
+            batch_ids = []
+            while len(batch_ids) < BATCH_SIZE:
+                try:
+                    vid = LOSSLESS_TASK_QUEUE.get_nowait()
+                    if vid:
+                        batch_ids.append(vid)
+                except queue.Empty:
+                    break
+                    
+            if not batch_ids:
+                time.sleep(1)
+                continue
+                
+            batch_num += 1
+            t_start = time.time()
             with LOSSLESS_JOBS_LOCK:
-                LOSSLESS_JOBS[video_id] = {"status": "progressing", "timestamp": time.time()}
-                if len(LOSSLESS_JOBS) > 1000:
-                    # Prune oldest job entry to preserve RAM
-                    oldest = next(iter(LOSSLESS_JOBS))
-                    LOSSLESS_JOBS.pop(oldest, None)
-            LOSSLESS_STATS["progressing"] += 1
-            if LOSSLESS_STATS["queued"] > 0:
-                LOSSLESS_STATS["queued"] -= 1
-            try:
+                for vid in batch_ids:
+                    LOSSLESS_JOBS[vid] = {"status": "progressing", "timestamp": time.time()}
+            LOSSLESS_STATS["progressing"] = len(batch_ids)
+            LOSSLESS_STATS["queued"] = LOSSLESS_TASK_QUEUE.qsize()
+            
+            log.info(f"[LOSSLESS] 🚀 Batch #{batch_num}: Processing {len(batch_ids)} tracks in parallel (50 workers | Queue: {LOSSLESS_TASK_QUEUE.qsize()} remaining)")
+            
+            def process_single_lossless(vid: str):
                 name, artists = "", ""
                 with db_service.DB_CACHE_LOCK:
-                    row = db_service.DB_CACHE.get(video_id) or {}
+                    row = db_service.DB_CACHE.get(vid) or {}
                     name = row.get("name") or ""
                     artists = row.get("artists") or ""
                 if not name or name == "Unknown Song":
-                    name, artists = db_service.fetch_correct_metadata(video_id)
-                success = qobuz_service.process_qobuz_lossless(video_id, name, artists)
-                if isinstance(success, dict) and success.get("success"):
-                    ext = success.get("ext", "flac")
-                    db_service.db_save_lossless_source(video_id, f"4:{ext}")
-                    with LOSSLESS_JOBS_LOCK:
-                        LOSSLESS_JOBS[video_id] = {"status": "done", "timestamp": time.time(), "ext": ext}
-                    LOSSLESS_STATS["done"] += 1
+                    name, artists = db_service.fetch_correct_metadata(vid)
+                return qobuz_service.fetch_lossless_audio(vid, name, artists)
+
+            futures = {executor.submit(process_single_lossless, vid): vid for vid in batch_ids}
+            results = {}
+            for fut in as_completed(futures):
+                vid = futures[fut]
+                try:
+                    res = fut.result()
+                    results[vid] = res
+                except Exception:
+                    results[vid] = None
+                    
+            elapsed_dl = max(0.001, time.time() - t_start)
+            
+            success_files = []
+            failed_vids = []
+            total_bytes = 0
+            
+            for vid in batch_ids:
+                res = results.get(vid)
+                if res and res.get("audio_bytes"):
+                    success_files.append(res)
+                    total_bytes += len(res["audio_bytes"])
                 else:
-                    with FAILED_LOSSLESS_LOCK:
-                        FAILED_LOSSLESS_IDS.add(video_id)
-                    with LOSSLESS_JOBS_LOCK:
-                        LOSSLESS_JOBS[video_id] = {"status": "failed", "timestamp": time.time()}
-                    LOSSLESS_STATS["failed"] += 1
-            except Exception as ex:
+                    failed_vids.append(vid)
+                    
+            mb = total_bytes / (1024.0 * 1024.0)
+            dl_speed = mb / elapsed_dl
+            log.info(f"[LOSSLESS] ⚡ Batch #{batch_num}: {len(success_files)}/{len(batch_ids)} downloaded in {elapsed_dl:.1f}s ({dl_speed:.1f} MB/s) | {len(failed_vids)} failed")
+            
+            if success_files:
+                lossless_bucket = getattr(qobuz_service, "LOSSLESS_BUCKET_ID", "shashwatIDR/lossless")
+                log.info(f"[LOSSLESS] 📦 Batch #{batch_num}: Uploading {len(success_files)} FLAC files ({mb:.1f} MB) at once to HF bucket '{lossless_bucket}'...")
+                t_up = time.time()
+                add_list = [(item["audio_bytes"], f"{item['video_id']}.{item.get('ext', 'flac')}") for item in success_files]
+                try:
+                    from db_service import safe_batch_bucket_files
+                    safe_batch_bucket_files(lossless_bucket, add=add_list, token=HF_TOKEN)
+                    up_elapsed = max(0.001, time.time() - t_up)
+                    up_speed = mb / up_elapsed
+                    log.info(f"[LOSSLESS] ✅ Batch #{batch_num}: Upload completed in {up_elapsed:.1f}s ({up_speed:.1f} MB/s)!")
+                    
+                    for item in success_files:
+                        vid = item["video_id"]
+                        ext = item.get("ext", "flac")
+                        db_service.db_save_lossless_source(vid, f"4:{ext}")
+                        with LOSSLESS_JOBS_LOCK:
+                            LOSSLESS_JOBS[vid] = {"status": "done", "timestamp": time.time(), "ext": ext}
+                            
+                    LOSSLESS_STATS["done"] += len(success_files)
+                except Exception as up_err:
+                    log.error(f"[LOSSLESS] ❌ Batch #{batch_num}: Upload failed: {up_err}")
+                    for item in success_files:
+                        failed_vids.append(item["video_id"])
+                finally:
+                    del add_list
+                    del success_files
+                    db_service.cleanup_upload_cache()
+                    gc.collect()
+                    
+            if failed_vids:
                 with FAILED_LOSSLESS_LOCK:
-                    FAILED_LOSSLESS_IDS.add(video_id)
-                log.error(f"Lossless worker error for {video_id}: {ex}")
+                    for vid in failed_vids:
+                        FAILED_LOSSLESS_IDS.add(vid)
                 with LOSSLESS_JOBS_LOCK:
-                    LOSSLESS_JOBS[video_id] = {"status": "failed", "timestamp": time.time()}
-                LOSSLESS_STATS["failed"] += 1
-            finally:
-                if LOSSLESS_STATS["progressing"] > 0:
-                    LOSSLESS_STATS["progressing"] -= 1
-                with LOSSLESS_QUEUED_LOCK:
-                    LOSSLESS_QUEUED_SET.discard(video_id)
+                    for vid in failed_vids:
+                        LOSSLESS_JOBS[vid] = {"status": "failed", "timestamp": time.time()}
+                LOSSLESS_STATS["failed"] += len(failed_vids)
+                
+            with LOSSLESS_QUEUED_LOCK:
+                for vid in batch_ids:
+                    LOSSLESS_QUEUED_SET.discard(vid)
+            for _ in range(len(batch_ids)):
                 LOSSLESS_TASK_QUEUE.task_done()
+                
+            LOSSLESS_STATS["progressing"] = 0
+            log.info(f"[LOSSLESS] 📊 Batch #{batch_num} complete | Total Lossless Cached: {LOSSLESS_STATS['done']} | Failed: {LOSSLESS_STATS['failed']}")
+            
         except Exception as e:
-            log.error(f"Error in lossless worker thread loop: {e}")
+            log.error(f"[LOSSLESS] Error in lossless batch loop: {e}")
             time.sleep(1)
 
-LOSSLESS_WORKER_THREADS = []
-NUM_LOSSLESS_WORKERS = 100
-
 def start_lossless_workers_if_needed():
-    global LOSSLESS_WORKER_THREADS
-    alive_threads = [t for t in LOSSLESS_WORKER_THREADS if t.is_alive()]
-    if len(alive_threads) < NUM_LOSSLESS_WORKERS:
-        needed = NUM_LOSSLESS_WORKERS - len(alive_threads)
-        for i in range(needed):
-            t = threading.Thread(target=lossless_worker_loop, daemon=True, name=f"LosslessWorker-{len(alive_threads)+i+1}")
-            t.start()
-            LOSSLESS_WORKER_THREADS.append(t)
-        log.info(f"Started {needed} parallel lossless worker threads (total active: {NUM_LOSSLESS_WORKERS}).")
+    global LOSSLESS_PROCESSOR_THREAD
+    if LOSSLESS_PROCESSOR_THREAD is None or not LOSSLESS_PROCESSOR_THREAD.is_alive():
+        LOSSLESS_PROCESSOR_THREAD = threading.Thread(target=lossless_batch_worker_loop, daemon=True, name="LosslessBatchProcessor")
+        LOSSLESS_PROCESSOR_THREAD.start()
+        log.info(f"Started lossless batch processor ({NUM_LOSSLESS_WORKERS} parallel workers).")
 
 # --- Lossless Cleanup & Audit System State ---
 CLEANUP_STATE = {
@@ -810,7 +968,7 @@ def auto_lossless_sync_loop():
     time.sleep(10)  # initial delay for cache loading
     while True:
         try:
-            if not is_cleanup_active() and LOSSLESS_TASK_QUEUE.qsize() < 50:
+            if not is_cleanup_active() and LOSSLESS_TASK_QUEUE.qsize() < 100:
                 trigger_lossless_backup()
         except Exception as e:
             log.error(f"Error in auto_lossless_sync_loop: {e}")
@@ -821,7 +979,7 @@ def trigger_lossless_backup() -> int:
         log.info("Skipping lossless backup enqueueing: Cleanup process is currently active.")
         return 0
 
-    if LOSSLESS_TASK_QUEUE.qsize() >= 100:
+    if LOSSLESS_TASK_QUEUE.qsize() >= 300:
         return 0
 
     with DB_CACHE_LOCK:
@@ -836,32 +994,15 @@ def trigger_lossless_backup() -> int:
                     LOSSLESS_JOBS[vid] = {"status": "queued", "timestamp": time.time()}
                 LOSSLESS_TASK_QUEUE.put(vid, high_priority=False)
                 count += 1
-                if LOSSLESS_TASK_QUEUE.qsize() >= 100:
+                if LOSSLESS_TASK_QUEUE.qsize() >= 300:
                     break
 
     LOSSLESS_STATS["queued"] = LOSSLESS_TASK_QUEUE.qsize()
     if count > 0:
-        log.info(f"Lossless Backup: Enqueued {count} songs missing lossless audio.")
+        log.info(f"[LOSSLESS] Backup feeder: Enqueued {count} songs missing lossless audio (Total in queue: {LOSSLESS_STATS['queued']}).")
 
     start_lossless_workers_if_needed()
     return count
-
-
-def worker_loop():
-    while True:
-        try:
-            video_id = TASK_QUEUE.get()
-            if video_id is None:
-                continue
-            try:
-                process_stream_job(video_id)
-            finally:
-                with QUEUED_SET_LOCK:
-                    QUEUED_SET.discard(video_id)
-                TASK_QUEUE.task_done()
-        except Exception as e:
-            log.error(f"Error in worker thread: {e}")
-            time.sleep(1)
 
 def enqueue_song(video_id: str, high_priority: bool = True) -> bool:
     enqueued = False
@@ -911,12 +1052,14 @@ def enqueue_songs_batch(video_ids: list[str]) -> list[str]:
     return added
 
 def start_queue_workers():
-    global WORKER_THREADS
-    for i in range(NUM_WORKERS):
-        t = threading.Thread(target=worker_loop, daemon=True, name=f"StreamWorker-{i+1}")
-        t.start()
-        WORKER_THREADS.append(t)
-    log.info(f"Started {NUM_WORKERS} background stream processing worker threads.")
+    global STREAM_PROCESSOR_THREAD, LOSSLESS_PROCESSOR_THREAD
+    if STREAM_PROCESSOR_THREAD is None or not STREAM_PROCESSOR_THREAD.is_alive():
+        STREAM_PROCESSOR_THREAD = threading.Thread(target=stream_batch_worker_loop, daemon=True, name="StreamBatchProcessor")
+        STREAM_PROCESSOR_THREAD.start()
+    if LOSSLESS_PROCESSOR_THREAD is None or not LOSSLESS_PROCESSOR_THREAD.is_alive():
+        LOSSLESS_PROCESSOR_THREAD = threading.Thread(target=lossless_batch_worker_loop, daemon=True, name="LosslessBatchProcessor")
+        LOSSLESS_PROCESSOR_THREAD.start()
+    log.info(f"Started 100 parallel workers in total (50 Stream workers + 50 Lossless workers, batch-upload).")
 
 def db_get_song_stream(video_id: str) -> Optional[dict]:
     with DB_CACHE_LOCK:
@@ -953,7 +1096,7 @@ def auto_stream_sync_loop():
                     for vid in missing:
                         if vid not in QUEUED_SET:
                             enqueue_song(vid, high_priority=False)
-                            if TASK_QUEUE.qsize() >= 100:
+                            if TASK_QUEUE.qsize() >= 300:
                                 break
         except Exception as e:
             log.error(f"Error in auto_stream_sync_loop: {e}")
