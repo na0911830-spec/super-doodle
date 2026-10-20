@@ -109,6 +109,23 @@ class PriorityTaskQueue:
                 self.cond.wait()
             return self.deque.popleft()
 
+    def get_nowait(self):
+        with self.lock:
+            if not self.deque:
+                raise queue.Empty
+            return self.deque.popleft()
+
+    def get_batch(self, max_items=50):
+        with self.lock:
+            items = []
+            while self.deque and len(items) < max_items:
+                items.append(self.deque.popleft())
+            return items
+
+    def empty(self):
+        with self.lock:
+            return len(self.deque) == 0
+
     def qsize(self):
         with self.lock:
             return len(self.deque)
@@ -250,14 +267,7 @@ def stream_batch_worker_loop():
     
     while True:
         try:
-            batch_ids = []
-            while len(batch_ids) < BATCH_SIZE:
-                try:
-                    vid = TASK_QUEUE.get_nowait()
-                    if vid:
-                        batch_ids.append(vid)
-                except queue.Empty:
-                    break
+            batch_ids = TASK_QUEUE.get_batch(BATCH_SIZE)
             
             if not batch_ids:
                 time.sleep(1)
@@ -388,15 +398,8 @@ def lossless_batch_worker_loop():
     
     while True:
         try:
-            batch_ids = []
-            while len(batch_ids) < BATCH_SIZE:
-                try:
-                    vid = LOSSLESS_TASK_QUEUE.get_nowait()
-                    if vid:
-                        batch_ids.append(vid)
-                except queue.Empty:
-                    break
-                    
+            batch_ids = LOSSLESS_TASK_QUEUE.get_batch(BATCH_SIZE)
+                     
             if not batch_ids:
                 time.sleep(1)
                 continue
