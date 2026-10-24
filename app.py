@@ -1689,6 +1689,38 @@ def add_stream_to_queue(id: str = Query(..., description="YouTube videoId or com
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.api_route("/api/lossless/add", methods=["GET", "POST"])
+def add_lossless_to_queue_endpoint(id: str = Query(..., description="YouTube videoId or comma-separated videoIds")):
+    try:
+        raw_ids = [v.strip() for v in id.split(",") if v.strip()]
+        if not raw_ids:
+            raise HTTPException(status_code=400, detail="No valid IDs provided")
+        queued_ids, already_lossless = [], []
+        with LOSSLESS_QUEUED_LOCK:
+            for vid in raw_ids:
+                with db_service.DB_CACHE_LOCK:
+                    row = db_service.DB_CACHE.get(vid) or {}
+                    l_val = str(row.get("lossless") or "").strip()
+                if l_val and l_val != "0":
+                    already_lossless.append(vid)
+                elif vid not in LOSSLESS_QUEUED_SET:
+                    LOSSLESS_QUEUED_SET.add(vid)
+                    with LOSSLESS_JOBS_LOCK:
+                        LOSSLESS_JOBS[vid] = {"status": "queued", "timestamp": time.time()}
+                    LOSSLESS_TASK_QUEUE.put(vid, high_priority=True)
+                    queued_ids.append(vid)
+                else:
+                    already_lossless.append(vid)
+        start_lossless_workers_if_needed()
+        return {
+            "message": f"Processed {len(raw_ids)} ID(s). {len(queued_ids)} queued for lossless resolution.",
+            "queued": queued_ids, "already_lossless": already_lossless
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.api_route("/api/lossless/cleanup", methods=["GET", "POST"])
 def trigger_lossless_cleanup_endpoint(server: Optional[str] = None):
     flac_url = server or "https://beautiful-junie-scoder-53c5187c.koyeb.app"

@@ -62,6 +62,12 @@ DB_URL = os.environ.get("DB_URL", "")
 HF_TOKEN = os.environ.get("HFTOKEN")
 BUCKET_ID = "shashwatIDR/stream"
 
+YTM_VIDEO_ID_REGEX = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+def is_valid_youtube_id(video_id: Optional[str]) -> bool:
+    """Validate that the ID is exactly an 11-character YouTube/YTM video ID."""
+    return bool(video_id and YTM_VIDEO_ID_REGEX.match(video_id))
+
 
 import ipaddress
 
@@ -650,6 +656,9 @@ def download_and_upload_loop(video_id: str) -> Optional[str]:
 
 @app.get("/api/stream")
 async def get_stream(id: str = Query(..., description="YouTube videoId"), background_tasks: BackgroundTasks = None):
+    if not is_valid_youtube_id(id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
+
     # 1. Check if stream is already cached
     row = db_get_song_stream(id)
     name = ""
@@ -818,6 +827,9 @@ def search_songs(q: Optional[str] = None, limit: int = 12):
 
 @app.get("/api/lyrics/{video_id}")
 async def get_lyrics(video_id: str):
+    if not is_valid_youtube_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
+
     try:
         with DB_CACHE_LOCK:
             row = DB_CACHE.get(video_id)
@@ -865,6 +877,9 @@ async def get_lyrics(video_id: str):
 
 @app.get("/api/canvas")
 def get_canvas(id: str):
+    if not is_valid_youtube_id(id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
+
     try:
         with DB_CACHE_LOCK:
             row = DB_CACHE.get(id)
@@ -894,6 +909,9 @@ def get_canvas(id: str):
 
 @app.get("/api/canvas/stream/{video_id}")
 def stream_canvas(video_id: str):
+    if not is_valid_youtube_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
+
     try:
         with BASE_URL_CACHE_LOCK:
             url_base = BASE_URL_CACHE.get(2)
@@ -910,6 +928,9 @@ def stream_canvas(video_id: str):
 
 @app.get("/api/stream/listen/{video_id}")
 def listen_stream(video_id: str):
+    if not is_valid_youtube_id(video_id):
+        raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
+
     try:
         row = db_get_song_stream(video_id)
         
@@ -955,13 +976,14 @@ def add_stream_to_queue(id: str = Query(..., description="YouTube videoId or com
     """Add video ID(s) to the stream processing queue (in-memory execution). Accepts comma-separated IDs."""
     try:
         raw_ids = [v.strip() for v in id.split(",") if v.strip()]
-        if not raw_ids:
-            raise HTTPException(status_code=400, detail="No valid IDs provided")
+        valid_ids = [v for v in raw_ids if is_valid_youtube_id(v)]
+        if not valid_ids:
+            raise HTTPException(status_code=400, detail="Invalid YouTube video ID. Must be exactly 11 characters.")
             
         cached_ids = []
         queued_ids = []
         
-        for vid in raw_ids:
+        for vid in valid_ids:
             row = db_get_song_stream(vid)
             if row and row.get("stream_sources"):
                 cached_ids.append(vid)
